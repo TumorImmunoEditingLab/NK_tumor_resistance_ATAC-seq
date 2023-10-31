@@ -1,0 +1,1024 @@
+---
+title: "ATAC-Seq data analysis"
+author: Aleksandr Bykov
+output: html_notebook
+---
+
+
+### Loading necessary libraries. 
+```{r "Load essential libraries",  echo=FALSE, eval=TRUE}
+# load the required libraries
+library(readr)
+library(magrittr)
+library(IRanges)
+library(ggplot2)
+library(pheatmap)
+library(GenomicRanges)
+library(ggpubr)
+library(hypeR)
+library(DESeq2)
+library(dplyr)
+
+# load selected functions from libraries to avoid polluting the namespace
+import::from(stringr, str_extract, str_detect)
+import::from(reshape2, melt)
+import::from(pander, pander)
+import::from(.from = here::here("~/workspace/Rproject/00_utility_scripts.R"), "generatePCA", "meanExprsPerGroup", "extract_results_DDS", "plotVolcano","generatePCA_plus_shape", "plotVolcano", .character_only=TRUE)
+import::from(limma, removeBatchEffect )
+import::from(openxlsx, createWorkbook, addWorksheet, writeData, saveWorkbook)
+
+deg_dir <- "~/workspace/Rproject/Results/"
+
+# annotation_mm10 <- read.table("~/workspace/references/geneInfo.tab", sep = "\t", header = F, skip = 1)
+```
+
+# Loading data
+Building the initial S4 object, from feature counts and annotations, all obtained as a result of the ATAC-seq NF-core pipeline.
+BroadPeaks are used.
+```{r "Loading the feature counts and annotation data, assembling the metadata", echo = FALSE}
+##### Assembling the metadata ####
+#load 3 data sets
+
+if (!(file.exists( "~/workspace/Rproject/Results/RDSs/ATACSeq_DESeq2_obj_complete.rds") & 
+    file.exists( "~/workspace/Rproject/Results/RDSs/ATACSeq_DESeq2_obj_complete_consensus_1.rds"))) {
+
+  #Paths to the raw data
+  path_to_the_featurecounts_data <- "~/workspace/data_ATACSeq_nfcore_run/results/bwa/merged_library/macs2/broad_peak/consensus/consensus_peaks.mLb.clN.featureCounts.txt"
+  path_to_the_boolean_data <- "~/workspace/data_ATACSeq_nfcore_run/results/bwa/merged_library/macs2/broad_peak/consensus/consensus_peaks.mLb.clN.boolean.txt"
+  path_to_the_annotation_data <- "~/workspace/data_ATACSeq_nfcore_run/results/bwa/merged_library/macs2/broad_peak/consensus/consensus_peaks.mLb.clN.annotatePeaks.txt"
+  
+  #Read datasets
+  gene_counts <- read.csv(file = path_to_the_featurecounts_data, header = T, sep = "\t", skip = 1)
+  boolean_data <- read.csv(path_to_the_boolean_data, header = T, sep = '\t')
+  annotation_data <- read.csv(path_to_the_annotation_data, header = T, sep = '\t')
+  
+  # Assembling the DESeq2 object
+  # First, it's necessary to assemble the design metadata 
+  design_metadata <- data.frame()
+  sample_names <- colnames(gene_counts)
+  sample_names <- sample_names[str_detect( sample_names, 'EXP.*',)]
+  design_metadata <- data.frame(sample_initial_name = sample_names)
+  
+  sample_names <- gsub("\\.mLb\\.clN\\.sorted\\.bam$", "", sample_names, perl = TRUE)
+  design_metadata <- cbind(design_metadata, sample_names)
+  
+  sample_names_no_rep <-  gsub("_REP\\d", "", sample_names)
+  design_metadata <- cbind(design_metadata, sample_names_no_rep)
+  
+  experiment_id <- str_extract(sample_names, "(EXP)\\d\\_\\d")
+  experiment_id[str_detect(sample_names, "_9_4")] <- "EXP9_4"
+  design_metadata <- cbind(design_metadata, experiment_id)
+  
+  cell_line_id_original <- str_extract(sample_names, "(\\d{2}[HOMG])")
+  design_metadata <- cbind(design_metadata, cell_line_id_original)
+  
+  #simplifying the labels
+  cell_line_id <- cell_line_id_original %>%
+                        replace(. == "13G", "A") %>%
+                        replace(. == "13H", "B") %>%
+                        replace(. == "15M", "C") %>%
+                        replace(. == "15O", "D") 
+  design_metadata <- cbind(design_metadata, cell_line_id)
+  
+  condition <-  str_extract(sample_names, "Tumor_only|Tumor_plus_NK")
+  design_metadata <- cbind(design_metadata, condition)
+  
+  #Transforming the data according to the metadata xlsx sheet.
+  timepoint <- str_extract(sample_names, "Tumor_only|Day\\d{1,2}")
+  timepoint <- timepoint %>%
+                  replace(. == ("Day4"), 'Timepoint_1') %>%
+                  replace(. == ("Tumor_only"), 'Timepoint_1') %>%
+                  replace(. == ("Day6"), 'Timepoint_1') %>%
+                  replace(. == ("Day10"), 'Timepoint_2') %>%
+                  replace(. == ("Day14"), 'Timepoint_2') %>%
+                  replace(. == ("Day16"), 'Timepoint_2')
+  design_metadata <- cbind(design_metadata, timepoint)
+  
+  day_info <- str_extract(sample_names, "Tumor_only|Day\\d{1,2}")
+  day6_TO_bool <- str_detect(sample_names, "EXP9_7.*Tumor_only")
+  day_info[day6_TO_bool] <- "Day6"
+  day_info <- day_info %>% 
+                  replace(. == ("Tumor_only"), 'Day4')
+  design_metadata <- cbind(design_metadata, day_info)
+  
+  condition_tp <- paste0(design_metadata$condition, 
+                         gsub(pattern = "Timepoint", replacement = "_TP", x = design_metadata$timepoint))
+  design_metadata <- cbind(design_metadata, condition_tp)
+  
+  replica <-  str_extract(sample_names, "REP\\d")
+  design_metadata <- cbind(design_metadata, replica)
+  
+
+  #### Assembling the DESeq2 Object ####
+  # Important remark - the formula in the object does NOT remove the batch effect!
+  
+  desing_formula <- as.formula("~ experiment_id + cell_line_id + condition_tp")
+  CountData <- gene_counts[str_detect(colnames(gene_counts), 'EXP.*',)]
+  
+  # Assembling the DESeq2 object. 
+  # The Warning "some variables in design formula are characters, converting to factors" is normal.
+  dds <- DESeqDataSetFromMatrix(countData = CountData, colData = design_metadata, design = desing_formula)
+  
+  #Now, adding gene range information
+  rowRanges(dds) <- GRanges(paste0('chr',gene_counts[,2]), 
+                            IRanges(start = gene_counts[,3], 
+                                    end = gene_counts[,4], 
+                                    width = gene_counts[,6]),
+                            strand = gene_counts[,5])
+  
+  #Adding the names of intervals to the metadata column (for rows)                          
+  mcols(dds) <- cbind(mcols(dds), gene_counts$Geneid)                   
+  
+  # adding annotation of the columns
+  # This just orders the annotations data so this matches the metadata (mcol) in the dds
+  colnames(annotation_data)[1] <- "PeakId"
+  matched_row_ns <- match(dds@rowRanges$`gene_counts$Geneid`, annotation_data$PeakId) 
+  annotation_data <- annotation_data[matched_row_ns,]                                 
+  mcols(dds) <- annotation_data
+  
+  #### Now we can determine the consensus peaks ####
+  # we will be quite strict and determine a peak as a consensus only if it is present in all replicates of one experiment
+  col_indexes_bool <- str_detect(colnames(boolean_data), '.bool')
+  consensus_genes_bool <- boolean_data[,col_indexes_bool]
+  colnames(consensus_genes_bool) <- gsub(".mLb.clN.bool", "", colnames(consensus_genes_bool))
+  
+  # group samples into replicates
+  unique_experiments_table <- table(gsub("_REP\\d","", colnames(consensus_genes_bool)))
+  
+  consensus_replicas_combined_bool <- data.frame(matrix(ncol = 0, nrow = nrow(consensus_genes_bool)))
+  
+  for (exp_name in names(unique_experiments_table)){
+    column_selector <- str_detect(colnames(consensus_genes_bool), exp_name)
+    tmp_df <- apply(consensus_genes_bool[,column_selector], 1, prod)
+    consensus_replicas_combined_bool <- cbind(consensus_replicas_combined_bool, tmp_df)
+  }
+  colnames(consensus_replicas_combined_bool) <- names(unique_experiments_table)
+  
+  #here we can see how many peaks we have overlapping in each group
+  # number of samples hardcoded
+  number_of_peaks <- c()
+  rsms <- rowSums(consensus_replicas_combined_bool)
+  for (i in 1:42){
+    number_of_peaks <- c(number_of_peaks, sum(rsms >= i))
+  }
+  
+  plot(number_of_peaks, 
+       xlab = "Number of groups that have a peak",
+       ylab = "Number of peaks")
+  
+  # We will use the ones that are >= 1 - detected in at least one experiment (but in all replicates)
+  consensus_replicas_combined_bool$consensus_1 <- rowSums(consensus_replicas_combined_bool) >= 1
+  consensus_replicas_combined_bool$consensus_2 <- rowSums(consensus_replicas_combined_bool) >= 2
+  consensus_replicas_combined_bool <- cbind(boolean_data[,1:6], consensus_replicas_combined_bool)
+  
+  consensus_replicas_combined_bool[,c('consensus_1', 'consensus_2')]
+  mcols(dds) <- cbind(annotation_data, consensus_replicas_combined_bool[,c('consensus_1', 'consensus_2')])
+  
+  #now we can subset a DESeq2 object, that contains only >=1 consensus peak
+  dds_consens_1 <- dds[mcols(dds)$consensus_1,]
+  
+  #save the obtained RDSs
+  if (!dir.exists("~/workspace/Rproject/Results/RDSs")){
+    dir.create("~/workspace/Rproject/Results/RDSs")
+  }
+  
+  saveRDS(dds, file = "~/workspace/Rproject/Results/RDSs/ATACSeq_DESeq2_obj_complete.rds")
+  saveRDS(dds_consens_1, file = "~/workspace/Rproject/Results/RDSs/ATACSeq_DESeq2_obj_complete_consensus_1.rds")
+
+}else {
+  dds <- readRDS(file = "~/workspace/Rproject/Results/RDSs/ATACSeq_DESeq2_obj_complete.rds")
+  dds_consens_1 <- readRDS(file = "~/workspace/Rproject/Results/RDSs/ATACSeq_DESeq2_obj_complete_consensus_1.rds")
+}
+
+
+```
+
+## First analysis step
+Look at the whole data set.
+
+```{r "Analysis part - looking at the whole dataset", fig.height=15 }
+# Run the DESeq2 
+dds_consens_1 <- estimateSizeFactors(dds_consens_1)
+dds_consens_1 <- DESeq(dds_consens_1)
+
+# Here we are trying to do initial visualizations 
+# We can do several visualizations
+# Those are NOT transformed values! only normalized
+cm <- data.frame(counts(dds_consens_1, normalized=TRUE))
+rownames(cm) <- paste0(mcols(dds_consens_1)$Chr, '_', mcols(dds_consens_1)$Start, '_', mcols(dds_consens_1)$End, "_",  mcols(dds_consens_1)$PeakId)
+lf <-  melt(cm, id.vars=c())
+lf$variable <- gsub("\\.mLb\\.clN\\.sorted\\.bam","",lf$variable)
+pander(head(lf))
+
+#We can check how the normalized counts are distributed with box plots and with lineplots:
+p1 <- ggplot(data=lf, aes(x=variable, y=value)) + 
+        geom_boxplot(aes(group=variable)) + 
+        xlab("Sample") + 
+        ylab("Normalized Count") + 
+        coord_flip()
+
+p2 <- ggplot(data=lf, aes(x=value)) + 
+        geom_freqpoly(aes(group=variable, color=variable), bins=30) + 
+        xlab("Sample") + 
+        ylab("Normalized Count") + 
+        theme(legend.position="none")
+
+#Check the dependency of the library size and size factor
+libsize <-  data.frame(x=sizeFactors(dds_consens_1), 
+                       y=colSums(assay(dds_consens_1)))
+p3 <- ggplot(data=libsize, aes(x=x, y=y)) + geom_point() + geom_smooth(method="lm") + xlab("Estimated size factor") + ylab("Library size")
+
+plot(p1)
+plot(p2)
+plot(p3)
+rm(p1,p2,p3)
+
+# It's important to transform the data BEFORE visualisation:
+# https://compbiocore.github.io/deseq-workshop-1/assets/deseq_workshop_1.html#Why-is-it-Important-to-Transform-Data-Before-Analysis?
+
+#Transforming the data:
+vsd <- vst(dds_consens_1, blind = FALSE)
+
+#Check if there are any outliers or anomalies that are associated with experiment
+pca_dar <- generatePCA(transf_object = vsd, 
+                       cond_interest_varPart = c("condition_tp", "cell_line_id", "experiment_id"), 
+                       color_variable = "condition_tp", 
+                       shape_variable = "experiment_id",
+                       ntop_genes = 1000) +
+           ggtitle("Original dataset") +
+           scale_color_manual(values = c("#DD3344",  "#FF9F1C","#553388"))
+
+plot(pca_dar)
+#we can see that there is no drastic effect of experiment, but there are two groups 
+
+#let's check the cell lines
+pca_dar <- generatePCA(transf_object = vsd, 
+                       cond_interest_varPart = c("condition_tp", "cell_line_id", "experiment_id"), 
+                       color_variable = "condition_tp", 
+                       shape_variable = "cell_line_id",
+                       ntop_genes = 1000) +
+              scale_color_manual(values = c("#DD3344",  "#FF9F1C","#553388")) +
+              ggtitle("Original dataset") 
+
+plot(pca_dar)
+#The main separation was because of cell id
+# that's why we analyze AB and CD separately
+
+deg_dir <- "~/workspace/Rproject/Results/"
+ggsave(filename = paste0(deg_dir,"/AB_CD/", "AB_CD_PCA_not_batch_corrected.png"), 
+       plot=pca_dar,
+       width = 20, height = 14, units = "cm")
+
+ggsave(filename = paste0(deg_dir,"/AB_CD/", "AB_CD_PCA_not_batch_corrected.eps"), 
+       plot=pca_dar,
+       width = 20, height = 14, units = "cm")
+```
+
+
+## Comparison of A&B cell lines. 
+```{r "Comparing A vs B groups - subsetting and plotting PCAs before and after batch correction", fig.width= 12, fig.height= 6}
+
+####
+# AS we can see the main variability is coming from cell_lineage variable.
+# So, I will try to compare A vs B and C vs D cell lines and then work with obtained gene sets.
+####
+
+# Subsetting A and B cell ids
+# We will use only peaks that are located next to a TSS in a range of 3000bp.
+dds_consens_1_AB <-  dds[mcols(dds)$consensus_1, dds$cell_line_id %in% c("A","B")]
+dds_consens_1_AB$cell_line_id <- droplevels(dds_consens_1_AB$cell_line_id)
+dds_consens_1_AB$experiment_id <- droplevels(dds_consens_1_AB$experiment_id)
+dds_consens_1_AB <- dds_consens_1_AB[rowData(dds_consens_1_AB)$Chr %in% c(1:19, "X", "Y"),]  
+dds_consens_1_AB <- dds_consens_1_AB[abs(rowData(dds_consens_1_AB)$Distance.to.TSS) <=3000 ,]
+
+ab_peaks <- cbind.data.frame(rowData(dds_consens_1_AB)$Chr, 
+                  rowData(dds_consens_1_AB)$Start, 
+                  rowData(dds_consens_1_AB)$End, 
+                  rowData(dds_consens_1_AB)$PeakId)
+write.table(ab_peaks, 
+            file = "~/workspace/Rproject/Results/AB/ab_3000bp_around_TSS.bed", 
+            sep = "\t", 
+            quote = F, 
+            row.names = F, 
+            col.names = F)
+
+dds_consens_1_AB <- estimateSizeFactors(dds_consens_1_AB)
+dds_consens_1_AB <- DESeq(dds_consens_1_AB)
+
+# Transforming the data
+vsd_AB <- vst(dds_consens_1_AB, blind = FALSE)
+
+pca_deg <- generatePCA_plus_shape(transf_object = vsd_AB, 
+                       cond_interest_varPart = c("cell_line_id", "experiment_id","condition_tp"), 
+                       color_variable = "condition_tp", 
+                       shape_variable = "Cell_line_label_and_exp_id",
+                       ntop_genes = 1000)+
+              ggtitle("Original dataset") +
+              scale_shape_manual(values = c(0,1,2,15,16,17)) +
+              scale_color_manual(values = c("#DD3344",  "#FF9F1C","#553388"))
+plot(pca_deg)
+
+# we can see that PC1 is contributing to the separation by the experiment, so there is a bathc effect here. We can try to correct for it.
+
+deg_dir <- "~/workspace/Rproject/Results/AB/"
+ggsave(filename = paste0(deg_dir, "TpNK_tp2_vs_Tonly_tp1_AB_PCA_not_batch_corrected.png"), 
+       plot=pca_deg,
+       width = 20, 
+       height = 14, 
+       units = "cm")
+
+ggsave(filename = paste0(deg_dir, "TpNK_tp2_vs_Tonly_tp1_AB_PCA_not_batch_corrected.eps"), 
+       plot=pca_deg,
+       width = 20, 
+       height = 14, 
+       units = "cm")
+
+
+#try to remove batch effect with limma
+vsd_AB_beff_rm <- vsd_AB
+vsd_AB_beff_rm_count <- removeBatchEffect(x = assay(vsd_AB_beff_rm), 
+                                          vsd_AB_beff_rm$experiment_id)
+assay(vsd_AB_beff_rm) <- vsd_AB_beff_rm_count
+
+pca_deg_NObatch_experiment <- generatePCA_plus_shape(transf_object = vsd_AB_beff_rm, 
+                       cond_interest_varPart = c("cell_line_id", "experiment_id","condition_tp"), 
+                       color_variable = "condition_tp", 
+                       shape_variable = "Cell_line_label_and_exp_id",
+                       ntop_genes = 1000)+
+  ggtitle("Batch Corrected Dataset") +
+  scale_shape_manual(values = c(0,1,2,15,16,17)) +
+  scale_color_manual(values = c("#DD3344",  "#FF9F1C","#553388"))
+plot(pca_deg_NObatch_experiment)
+
+#now -better. WE can see that PC1 is separating samples by condition
+ggsave(filename = file.path(deg_dir, "TpNK_tp2_vs_Tonly_tp1_AB_PCA_batch_corrected.png"), 
+       plot=pca_deg_NObatch_experiment,
+       width = 20, height = 14, units = "cm")
+
+ggsave(filename = file.path(deg_dir, "TpNK_tp2_vs_Tonly_tp1_AB_PCA_batch_corrected.eps"), 
+       plot=pca_deg_NObatch_experiment,
+       width = 20, height = 14, units = "cm")
+
+```
+
+# We can identify the DARs and plot them
+```{r "volcano plot"}
+#now we will try to look at volcano plots and try to identify the variably opened regions
+#First, we will try to generate Result table.
+
+coeff_name <- "condition_tp_Tumor_plus_NK_TP_2_vs_Tumor_only_TP_1"
+cond_numerator <-  "Tumor_plus_NK_TP_2"
+cond_denominator <-  "Tumor_only_TP_1"
+cond_variable <-  "condition_tp"
+padj_cutoff <- 0.05
+log2FC_cutoff <- 0.58
+
+dds_consens_1_AB_results_list <- extract_results_DDS(dds_object = dds_consens_1_AB,
+                                                     coeff_name = coeff_name,
+                                                     cond_numerator = cond_numerator,
+                                                     cond_denominator = cond_denominator,
+                                                     cond_variable = cond_variable,
+                                                     padj_cutoff = 0.05,
+                                                     log2FC_cutoff = 0.58)
+#write the result to the xlsx file
+XLSX_OUT <- createWorkbook()
+addWorksheet(XLSX_OUT, "results_signif")
+addWorksheet(XLSX_OUT, "de_details")
+addWorksheet(XLSX_OUT, "results_all")
+
+writeData(XLSX_OUT, x = dds_consens_1_AB_results_list$results_signif, sheet = "results_signif")
+writeData(XLSX_OUT, x = dds_consens_1_AB_results_list$de_details, sheet = "de_details")
+writeData(XLSX_OUT, x = dds_consens_1_AB_results_list$results_all, sheet = "results_all")
+
+#plot volcano plot
+deg_dir <- "~/workspace/Rproject/Results/AB/"
+genes_of_interest2 <- c("Snx27","Olfr753-ps1", "Ppp1r21", "Gm7726", "Gm4951", "Gm4841", "Apol7e")
+genes_of_interest3 <- c("Pcdhac1","Tmc7", "Denn2b", "Stk32c")
+
+genes_of_interest <- list('Ifi44'     ="ENSMUSG00000028037", 
+                          'Iigp1'     ="ENSMUSG00000054072",
+                          'Serpina3f' ="ENSMUSG00000066363",
+                          'Ly6a'      ="ENSMUSG00000075602",
+                          'Plaat3'    ="ENSMUSG00000060675",
+                          'Lgals3bp'  ="ENSMUSG00000033880",
+                          'Ifi27'     ="ENSMUSG00000064215",
+                          'Gbp6'      ="ENSMUSG00000104713",
+                          'Rtp4'      ="ENSMUSG00000033355",
+                          'Tap1'      ="ENSMUSG00000037321",
+                          'Cdc42ep4'  ="ENSMUSG00000041598",
+                          'Sox6'      ="ENSMUSG00000051910",
+                          'Adprhl1'   ="ENSMUSG00000031448")
+
+volcano_plot_1 <- plotVolcano(dds_consens_1_AB_results_list$results_all, 
+                              genes_of_interest = names(genes_of_interest),
+                              genes_of_interest2 = genes_of_interest2,
+                              genes_of_interest3 = genes_of_interest3,
+                              plot_title = "AB Tumor + NK TP2 vs Tumor only TP1", max.overlaps = 100)
+
+plot(volcano_plot_1)
+
+ggsave(filename = file.path(deg_dir, "TpNK_tp2_vs_Tonly_tp1_volcano_plot.png"), 
+       plot=volcano_plot_1,
+       width = 20, height = 14, units = "cm")
+
+ggsave(filename = file.path(deg_dir, "TpNK_tp2_vs_Tonly_tp1_volcano_plot.eps"), 
+       plot=volcano_plot_1,
+       width = 20, height = 14, units = "cm")
+
+saveWorkbook(XLSX_OUT, "~/workspace/Rproject/Results/AB/DARs_AB_tp2_NK_vs_tumr_only_TP1.xlsx", overwrite = T)
+
+
+ab_peaks_signif <- cbind.data.frame(dds_consens_1_AB_results_list$results_signif$Chr, 
+                                    dds_consens_1_AB_results_list$results_signif$Start, 
+                                    dds_consens_1_AB_results_list$results_signif$End, 
+                                    dds_consens_1_AB_results_list$results_signif$PeakId)
+write.table(ab_peaks_signif, file = "~/workspace/Rproject/Results/AB/ab_3000bp_around_TSS_signif.bed", sep = "\t", quote = F, row.names = F, col.names = F)
+
+```
+
+
+```{r "Heatmap"}
+#Making Heatmap
+metadata_heatmap <- as.data.frame(colData(dds_consens_1_AB))
+heatmap_counts <- SummarizedExperiment::assay(vsd_AB)
+rownames(heatmap_counts) <- vsd_AB@rowRanges$PeakId
+
+heatmap_counts_NObatch <- SummarizedExperiment::assay(vsd_AB_beff_rm) 
+rownames(heatmap_counts_NObatch) <- vsd_AB_beff_rm@rowRanges$PeakId
+# removed xperiment batch effects! ? use experimen+cell_line removed???
+
+heatmap_counts_NObatch_deg <- heatmap_counts_NObatch[rownames(heatmap_counts_NObatch) %in% dds_consens_1_AB_results_list$results_signif$PeakId, ]
+
+annotation_col <- metadata_heatmap %>%
+  dplyr::select(experiment_id, cell_line_id, condition_tp) %>% # condition, timepoint_cell_harvesting, 
+  dplyr::arrange(condition_tp, cell_line_id,experiment_id)
+
+heatmap_counts_NObatch_deg_ord <- heatmap_counts_NObatch_deg[, match(rownames(annotation_col), colnames(heatmap_counts_NObatch_deg))]
+
+ensembl2symbol_annot <- dds_consens_1_AB_results_list$results_all %>%
+  dplyr::select(PeakId, Gene.Name)
+
+color.scheme <- rev(RColorBrewer::brewer.pal(8,"RdBu")) # generate the color scheme to use
+
+
+ann_colors = list(
+  experiment_id = c( EXP9_5 = "#005f73", EXP9_6 = "#0a9396", EXP9_7 = "#94d2bd"),
+  condition_tp = c(Tumor_only_TP_1 = "#DD3344", Tumor_plus_NK_TP_1 = "#FF9F1C",  Tumor_plus_NK_TP_2 = "#553388"),
+  cell_line_id = c(A = "#E9D8A6", B = "#D9BE6D")
+)
+
+heatmap_counts_NObatch_deg_ord_plot <- pheatmap::pheatmap(heatmap_counts_NObatch_deg_ord,
+                   main = "Heatmap of signif. DAR. Batch corrected",
+                   scale = "row",
+                   annotation_col = annotation_col,
+                   annotation_colors = ann_colors,
+                   #annotation_row = row_annot_symbols,
+                   show_colnames = FALSE,
+                   show_rownames = FALSE,
+                   cluster_cols = FALSE,
+                   #cluster_rows = counts_deg_ord_row_cor_hclust,
+                   color = color.scheme,
+                   #cutree_rows = 5,
+                   #gaps_col = gap_cols,
+                   #labels_row = make_bold_names(vsd_tp2_vs_tp1_inclEXP9_7_counts_deg_ord_symbols, rownames, rc_names = names(genes_of_interest)),
+                   fontsize = 10, fontsize_row = 10 #height=10, cellwidth = 11, cellheight = 11
+                   ) 
+
+ggsave(filename = file.path(deg_dir, "heatmap_counts_batch_eff_removed_deg_ord_plot.png"), 
+       plot=heatmap_counts_NObatch_deg_ord_plot,
+       width = 18, height = 20, units = "cm")
+ggsave(filename = file.path(deg_dir, "heatmap_counts_batch_eff_removed_deg_ord_plot.eps"), 
+       plot=heatmap_counts_NObatch_deg_ord_plot,
+       width = 18, height = 20, units = "cm")
+```
+
+
+```{r "check correlation to RNA-seq"}
+
+#first - load the AB RNA-seq xlsx sheet
+AB_RNA_seq <- openxlsx::read.xlsx("~/workspace/Rproject/sup_data/deg_TpNK_tp2_vs_Tonly_tp1_AB_results.xlsx",sheet = 1)
+
+#plotting venn diagrams
+AB_up <- list(
+  AB_RNA_up = AB_RNA_seq[AB_RNA_seq$log2FoldChange>0,]$mgi_symbol,
+  AB_ATAC_up = dds_consens_1_AB_results_list$results_signif[dds_consens_1_AB_results_list$results_signif$log2FoldChange>0,]$Gene.Name)
+
+AB_down <- list(
+AB_RNA_down = AB_RNA_seq[AB_RNA_seq$log2FoldChange<0,]$mgi_symbol,
+AB_ATAC_down = dds_consens_1_AB_results_list$results_signif[dds_consens_1_AB_results_list$results_signif$log2FoldChange<0,]$Gene.Name)
+
+AB_UP_venn_plot <- ggvenn::ggvenn(
+  AB_up, 
+  fill_color = c("#E0E2E3", "#8EA7CE"),
+  stroke_size = 0.5, set_name_size = 4
+  )
+
+ggsave(filename = file.path(deg_dir,  "AB_ATAC_RNA_Venn_diag_up.png"), 
+       plot=AB_UP_venn_plot,
+       width = 10, height = 10, units = "cm")
+
+ggsave(filename = file.path(deg_dir, "AB_ATAC_RNA_Venn_diag_up.eps"), 
+       plot=AB_UP_venn_plot,
+       width = 10, height = 10, units = "cm")
+
+
+AB_down_venn_plot <- ggvenn::ggvenn(
+  AB_down, 
+  fill_color = c("#E0E2E3", "#8EA7CE"),
+  stroke_size = 0.5, set_name_size = 4
+  )
+
+ggsave(filename = file.path(deg_dir,  "AB_ATAC_RNA_Venn_diag_down.png"), 
+       plot=AB_down_venn_plot,
+       width = 10, height = 10, units = "cm")
+
+ggsave(filename = file.path(deg_dir, "AB_ATAC_RNA_Venn_diag_down.eps"), 
+       plot=AB_down_venn_plot,
+       width = 10, height = 10, units = "cm")
+
+
+```
+
+```{r Comparing C and D groups}
+####
+# AS we can see the main variability is coming from cell_lineage variable.
+# So, I will try to compare A vs B and C vs D cell lines and then work with obtained gene sets.
+####
+
+# Comparing C and D
+dds_consens_1_CD <- dds[mcols(dds)$consensus_1, dds$cell_line_id %in% c("C","D")]
+dds_consens_1_CD$cell_line_id <- droplevels(dds_consens_1_CD$cell_line_id)
+
+dds_consens_1_CD <- dds_consens_1_CD[rowData(dds_consens_1_CD)$Chr %in% c(1:19, "X", "Y"),]  
+dds_consens_1_CD <- dds_consens_1_CD[abs(rowData(dds_consens_1_CD)$Distance.to.TSS) <=3000 ,]
+
+dds_consens_1_CD <- estimateSizeFactors(dds_consens_1_CD)
+dds_consens_1_CD <- DESeq(dds_consens_1_CD)
+
+#Transformation of the data
+vsd_CD <- vst(dds_consens_1_CD, blind = FALSE)
+
+pca_deg <- generatePCA_plus_shape(transf_object = vsd_CD, 
+                       cond_interest_varPart = c("cell_line_id", "experiment_id","condition_tp"), 
+                       color_variable = "condition_tp", 
+                       shape_variable = "Cell_line_label_and_exp_id",
+                       ntop_genes = 1000)+
+  ggtitle("Original dataset") +
+  scale_shape_manual(values = c(0,1,2,5,15,16,17,18)) +
+  scale_color_manual(values = c("#DD3344",  "#FF9F1C","#553388"))
+pca_deg
+
+deg_dir <- "~/workspace/Rproject/Results/CD/"
+
+ggsave(filename = file.path(deg_dir, "TpNK_tp2_vs_Tonly_tp1_CD_PCA_not_batch_corrected.png"), 
+       plot=pca_deg,
+       width = 20, height = 14, units = "cm")
+
+ggsave(filename = file.path(deg_dir, "TpNK_tp2_vs_Tonly_tp1_CD_PCA_not_batch_corrected.eps"), 
+       plot=pca_deg,
+       width = 20, height = 14, units = "cm")
+
+
+#try to remove batch effect with limma
+vsd_CD_beff_rm <- vsd_CD
+vsd_CD_beff_rm_count <- removeBatchEffect(x = assay(vsd_CD_beff_rm), vsd_CD_beff_rm$experiment_id)
+assay(vsd_CD_beff_rm) <- vsd_CD_beff_rm_count
+
+pca_deg_NObatch_experiment <- generatePCA_plus_shape(transf_object = vsd_CD_beff_rm, 
+                       cond_interest_varPart = c("cell_line_id", "experiment_id","condition_tp"), 
+                       color_variable = "condition_tp", 
+                       shape_variable = "Cell_line_label_and_exp_id",
+                       ntop_genes = 1000)+
+  ggtitle("Batch Corrected Dataset") +
+  scale_shape_manual(values = c(0,1,2,5,15,16,17,18)) +
+  scale_color_manual(values = c("#DD3344",  "#FF9F1C","#553388"))
+pca_deg_NObatch_experiment
+
+ggsave(filename = file.path(deg_dir, "TpNK_tp2_vs_Tonly_tp1_CD_PCA_batch_corrected.png"), 
+       plot=pca_deg_NObatch_experiment,
+       width = 20, height = 14, units = "cm")
+
+ggsave(filename = file.path(deg_dir, "TpNK_tp2_vs_Tonly_tp1_CD_PCA_batch_corrected.eps"), 
+       plot=pca_deg_NObatch_experiment,
+       width = 20, height = 14, units = "cm")
+```
+
+
+```{r "DE results and Volcano plots for CD"}
+
+#now I will try to look at volcano plots and try to identify the variably opened regions
+#First, I will try to generate Result table, using code from P. Repishak
+coeff_name <- 'condition_tp_Tumor_plus_NK_TP_2_vs_Tumor_only_TP_1'
+cond_numerator <-  "Tumor_plus_NK_TP_2"
+cond_denominator <-  "Tumor_only_TP_1"
+cond_variable <-  "condition_tp"
+padj_cutoff = 0.05
+log2FC_cutoff = 0.58
+
+dds_consens_1_CD_results_list <- extract_results_DDS(dds_object = dds_consens_1_CD,
+                                                     coeff_name = coeff_name,
+                                                     cond_numerator = cond_numerator,
+                                                     cond_denominator = cond_denominator,
+                                                     cond_variable = cond_variable,
+                                                     padj_cutoff = 0.05,
+                                                     log2FC_cutoff = 0.58)
+
+#write the result to the xlsx file
+XLSX_OUT <- createWorkbook()
+addWorksheet(XLSX_OUT, "results_signif")
+addWorksheet(XLSX_OUT, "de_details")
+addWorksheet(XLSX_OUT, "results_all")
+
+writeData(XLSX_OUT, x = dds_consens_1_CD_results_list$results_signif, sheet = "results_signif")
+writeData(XLSX_OUT, x = dds_consens_1_CD_results_list$de_details, sheet = "de_details")
+writeData(XLSX_OUT, x = dds_consens_1_CD_results_list$results_all, sheet = "results_all")
+
+#plot volcano
+deg_dir <- "~/workspace/Rproject/Results/CD/"
+
+genes_of_interest <- list('Ifi44'     ="ENSMUSG00000028037", 
+                          'Iigp1'     ="ENSMUSG00000054072",
+                          'Serpina3f' ="ENSMUSG00000066363",
+                          'Ly6a'      ="ENSMUSG00000075602",
+                          'Lgals3bp'  ="ENSMUSG00000033880",
+                          'Ifi27'     ="ENSMUSG00000064215",
+                          'Gbp6'      ="ENSMUSG00000104713",
+                          'Rtp4'      ="ENSMUSG00000033355",
+                          'Tap1'      ="ENSMUSG00000037321",
+                          'Sox6'      ="ENSMUSG00000051910")
+
+
+genes_of_interest2 <- c("BE692007","Gm8369", "Irf1", "Mx1", "Gm8369", "Gm8918", "Gm8369", "Gm39244", "Gm19261")
+genes_of_interest3 <- c("Ighd2-4", "Gm37910", "Ighd2-3", "Ros1")
+
+volcano_plot_2 <- plotVolcano(dds_consens_1_CD_results_list$results_all, 
+                              genes_of_interest = names(genes_of_interest),
+                              plot_title = "CD Tumor + NK TP2 vs Tumor only TP1",
+                              genes_of_interest2 = genes_of_interest2,
+                              genes_of_interest3 = genes_of_interest3,
+                              max.overlaps = 40)
+
+ggsave(filename = file.path(deg_dir,  "TpNK_tp2_vs_Tonly_tp1_volcano.png"), 
+       plot=volcano_plot_2,
+       width = 20, height = 14, units = "cm")
+ggsave(filename = file.path(deg_dir,"TpNK_tp2_vs_Tonly_tp1_volcano.eps"), 
+       plot=volcano_plot_2,
+       width = 20, height = 14, units = "cm")
+
+saveWorkbook(XLSX_OUT, "~/workspace/Rproject/Results/CD/CD_tp2_NK_vs_tumr_only_TP1_only.xlsx")
+
+```
+
+
+
+```{r "CD HEATMAP"}
+#Making Heatmap
+metadata_heatmap <- as.data.frame(colData(dds_consens_1_CD))
+
+heatmap_counts <- SummarizedExperiment::assay(vsd_CD)
+rownames(heatmap_counts) <- vsd_CD@rowRanges$PeakId
+
+heatmap_counts_NObatch <- SummarizedExperiment::assay(vsd_CD_beff_rm) 
+rownames(heatmap_counts_NObatch) <- vsd_CD_beff_rm@rowRanges$PeakId
+# removed xperiment batch effects! ? use experimen+cell_line removed???
+
+heatmap_counts_deg <- heatmap_counts[rownames(heatmap_counts) %in% dds_consens_1_CD_results_list$results_signif$PeakId, ]
+heatmap_counts_NObatch_deg <- heatmap_counts_NObatch[rownames(heatmap_counts_NObatch) %in% dds_consens_1_CD_results_list$results_signif$PeakId, ]
+
+annotation_col <- metadata_heatmap %>%
+  dplyr::select(experiment_id, cell_line_id, condition_tp) %>% # condition, timepoint_cell_harvesting, 
+  dplyr::arrange(condition_tp, cell_line_id, experiment_id)
+
+heatmap_counts_deg_ord <- heatmap_counts_deg[, match(rownames(annotation_col), colnames(heatmap_counts_deg))]
+heatmap_counts_NObatch_deg_ord <- heatmap_counts_NObatch_deg[, match(rownames(annotation_col), colnames(heatmap_counts_NObatch_deg))]
+
+ensembl2symbol_annot <- dds_consens_1_CD_results_list$results_all %>%
+  dplyr::select(PeakId, Gene.Name)
+
+color.scheme <- rev(RColorBrewer::brewer.pal(8,"RdBu")) # generate the color scheme to use
+
+ann_colors = list(
+  experiment_id = c(EXP9_4 = "#00262E", EXP9_5 = "#005f73", EXP9_6 = "#0a9396", EXP9_7 = "#94d2bd"),
+  condition_tp = c(Tumor_only_TP_1 = "#DD3344", Tumor_plus_NK_TP_1 = "#FF9F1C",  Tumor_plus_NK_TP_2 = "#553388"),
+  cell_line_id = c(C = "#E9D8A6", D = "#D9BE6D")
+)
+
+
+heatmap_counts_NObatch_deg_ord_plot <- pheatmap::pheatmap(heatmap_counts_NObatch_deg_ord,
+                   main = "Heatmap of signif. DAR. NO batch effect",
+                   scale = "row",
+                   annotation_col = annotation_col,
+                   annotation_colors = ann_colors,
+                   #annotation_row = row_annot_symbols,
+                   show_colnames = FALSE,
+                   show_rownames = FALSE,
+                   cluster_cols = FALSE,
+                   #cluster_rows = counts_deg_ord_row_cor_hclust,
+                   color = color.scheme,
+                   #cutree_rows = 5,
+                   #gaps_col = gap_cols,
+                   #labels_row = make_bold_names(vsd_tp2_vs_tp1_inclEXP9_7_counts_deg_ord_symbols, rownames, rc_names = names(genes_of_interest)),
+                   fontsize = 10, fontsize_row = 10 #height=10, cellwidth = 11, cellheight = 11
+                   ) 
+
+deg_dir <- "~/workspace/Rproject/Results/CD/"
+ggsave(filename = file.path(deg_dir, "heatmap_counts_batch_eff_removed_deg_ord_plot.png"), 
+       plot=heatmap_counts_NObatch_deg_ord_plot,
+       width = 18, height = 20, units = "cm")
+ggsave(filename = file.path(deg_dir, "heatmap_counts_batch_eff_removed_deg_ord_plot.eps"), 
+       plot=heatmap_counts_NObatch_deg_ord_plot,
+       width = 18, height = 20, units = "cm")
+
+```
+
+
+```{r "check correlation to RNA-seq in CD"}
+
+CD_RNA_seq <- openxlsx::read.xlsx("~/workspace/Rproject/sup_data/deg_TpNK_tp2_vs_Tonly_tp1_CD_results.xlsx",sheet = 1)
+
+CD_up <- list(
+  CD_RNA_up = CD_RNA_seq[CD_RNA_seq$log2FoldChange>0,]$mgi_symbol,
+  CD_ATAC_up = dds_consens_1_CD_results_list$results_signif[dds_consens_1_CD_results_list$results_signif$log2FoldChange>0,]$Gene.Name)
+
+CD_down <- list(
+  CD_RNA_down = CD_RNA_seq[CD_RNA_seq$log2FoldChange<0,]$mgi_symbol,
+  CD_ATAC_down = dds_consens_1_CD_results_list$results_signif[dds_consens_1_CD_results_list$results_signif$log2FoldChange<0,]$Gene.Name)
+
+CD_UP_venn_plot <- ggvenn::ggvenn(
+  CD_up, 
+  fill_color = c("#E0E2E3", "#8EA7CE"),
+  stroke_size = 0.5, set_name_size = 4
+  )
+
+ggsave(filename = file.path(deg_dir, "CD_ATAC_RNA_Venn_diag_up.png"), 
+       plot=CD_UP_venn_plot,
+       width = 10, height = 10, units = "cm")
+
+ggsave(filename = file.path(deg_dir,  "CD_ATAC_RNA_Venn_diag_up.eps"), 
+       plot=CD_UP_venn_plot,
+       width = 10, height = 10, units = "cm")
+
+CD_down_venn_plot <- ggvenn::ggvenn(CD_down, 
+                                    fill_color = c("#E0E2E3", "#8EA7CE"),
+                                    stroke_size = 0.5, set_name_size = 4)
+
+ggsave(filename = file.path(deg_dir,  "CD_ATAC_RNA_Venn_diag_down.png"), 
+       plot=CD_down_venn_plot,
+       width = 10, height = 10, units = "cm")
+
+ggsave(filename = file.path(deg_dir,  "CD_ATAC_RNA_Venn_diag_down.eps"), 
+       plot=CD_down_venn_plot,
+       width = 10, height = 10, units = "cm")
+
+```
+
+
+```{r "compare AB and CD ATAC-seqs"}
+
+AB_CD_up_venn_plot <- ggvenn::ggvenn(
+  list(AB_ATAC_UP= AB_up$AB_ATAC_up,
+       CD_ATAC_UP= CD_up$CD_ATAC_up), 
+  fill_color = c("#E0E2E3", "#8EA7CE"),
+  stroke_size = 0.5, set_name_size = 4
+  )
+deg_dir <- "~/workspace/Rproject/Results/AB_CD"
+ggsave(filename = file.path(deg_dir, "Venn_diag_up_AB_CD_ATAC.png"), 
+       plot=AB_CD_up_venn_plot,
+       width = 10, height = 10, units = "cm")
+ggsave(filename = file.path(deg_dir, "Venn_diag_up_AB_CD_ATAC.eps"), 
+       plot=AB_CD_up_venn_plot,
+       width = 10, height = 10, units = "cm")
+
+
+AB_CD_down_venn_plot <- ggvenn::ggvenn(
+  list(AB_ATAC_DOWN= AB_down$AB_ATAC_down,
+       CD_ATAC_DOWN= CD_down$CD_ATAC_down), 
+  fill_color = c("#E0E2E3", "#8EA7CE"),
+  stroke_size = 0.5, set_name_size = 4
+  )
+deg_dir <- "~/workspace/Rproject/Results/AB_CD"
+ggsave(filename = file.path(deg_dir,  "Venn_diag_down_AB_CD_ATAC.png"), 
+       plot=AB_CD_down_venn_plot,
+       width = 10, height = 10, units = "cm")
+ggsave(filename = file.path(deg_dir,  "Venn_diag_down_AB_CD_ATAC.eps"), 
+       plot=AB_CD_down_venn_plot,
+       width = 10, height = 10, units = "cm")
+
+
+```
+
+```{r "now, I will try to see the overlaps between different genes from RNA seq and ATAC-seq"}
+
+#First - read the xlsx table
+
+RNA_seq_UP <- openxlsx::read.xlsx(xlsxFile = "~/workspace/Rproject/sup_data/AB_CD_up_down_DEGs.xlsx", sheet = 1)
+RNA_seq_DOWN <- openxlsx::read.xlsx(xlsxFile = "~/workspace/Rproject/sup_data/AB_CD_up_down_DEGs.xlsx", sheet = 2)
+
+AB_ATAC_UP <- unique(dds_consens_1_AB_results_list$results_signif$Gene.Name[dds_consens_1_AB_results_list$results_signif$FoldChange > 0])
+AB_ATAC_DOWN <- unique(dds_consens_1_AB_results_list$results_signif$Gene.Name[dds_consens_1_AB_results_list$results_signif$FoldChange < 0])
+CD_ATAC_UP <- unique(dds_consens_1_CD_results_list$results_signif$Gene.Name[dds_consens_1_CD_results_list$results_signif$FoldChange > 0])
+CD_ATAC_DOWN <- unique(dds_consens_1_CD_results_list$results_signif$Gene.Name[dds_consens_1_CD_results_list$results_signif$FoldChange < 0])
+
+ATAC_AB_CD_results <- c(list(
+  "AB_UP_unique" = setdiff(AB_ATAC_UP, intersect(AB_ATAC_UP, CD_ATAC_UP)),
+  "CD_UP_unique" = setdiff(CD_ATAC_UP, intersect(AB_ATAC_UP, CD_ATAC_UP)),
+  "AB_CD_UP_intersect" = intersect(AB_ATAC_UP, CD_ATAC_UP),
+  "AB_DOWN_unique" =  setdiff(AB_ATAC_DOWN, intersect(AB_ATAC_DOWN, CD_ATAC_DOWN)),
+  "CD_DOWN_unique" = setdiff(CD_ATAC_DOWN, intersect(AB_ATAC_DOWN, CD_ATAC_DOWN)),
+  "AB_CD_DOWN_unique" = intersect(AB_ATAC_DOWN, CD_ATAC_DOWN)))
+
+XLSX_OUT <- createWorkbook()
+
+cntr <- 0
+for (i in ATAC_AB_CD_results){
+  cntr <- cntr + 1 
+  addWorksheet(XLSX_OUT, names(ATAC_AB_CD_results)[cntr])
+  writeData(XLSX_OUT, x = ATAC_AB_CD_results[cntr], sheet = names(ATAC_AB_CD_results)[cntr])
+}
+saveWorkbook(XLSX_OUT, "~/workspace/Rproject/Results/AB_CD/AB_CD_ATAC_seq_unique_and_overlap.xlsx")
+
+
+result_list <- c(list(  
+                "AB_RNA_UP"         = RNA_seq_UP$AB_positive[!is.na(RNA_seq_UP$AB_positive)],
+                "AB_ATAC_UP"        = AB_ATAC_UP,
+                "AB_Intersect_UP"   = intersect(RNA_seq_UP$AB_positive[!is.na(RNA_seq_UP$AB_positive)], AB_ATAC_UP),
+                "AB_RNA_DOWN"       = RNA_seq_DOWN$AB_down[!is.na( RNA_seq_DOWN$AB_down)],
+                "AB_ATAC_DOWN"      = AB_ATAC_DOWN,
+                "AB_Intersect_DOWN" = intersect(RNA_seq_DOWN$AB_down[!is.na( RNA_seq_DOWN$AB_down)], AB_ATAC_DOWN),
+                
+                "CD_RNA_UP"         = RNA_seq_UP$CD_positive[!is.na(RNA_seq_UP$CD_positive)],
+                "CD_ATAC_UP"        = CD_ATAC_UP,
+                "CD_Intersect_UP"   = intersect(RNA_seq_UP$CD_positive[!is.na(RNA_seq_UP$CD_positive)], CD_ATAC_UP),
+                "CD_RNA_DOWN"       = RNA_seq_DOWN$CD_down[!is.na( RNA_seq_DOWN$CD_down)],
+                "CD_ATAC_DOWN"      = CD_ATAC_DOWN,
+                "CD_Intersect_DOWN" = intersect(RNA_seq_DOWN$CD_down[!is.na( RNA_seq_DOWN$CD_down)], CD_ATAC_DOWN)))
+
+result_list <- c(result_list,
+                 list("Global_intersect_UP" = intersect(result_list$AB_Intersect_UP, result_list$CD_Intersect_UP)),
+                 list("Global_intersect_DOWN" = intersect(result_list$AB_Intersect_DOWN, result_list$CD_Intersect_DOWN)))
+
+result_list_for_exlsx <- list()
+max_length <- max(lengths(result_list))
+for (list_element in result_list)
+{
+  result_list_for_exlsx <- c(result_list_for_exlsx, list(c(list_element, rep(NA, max_length - length(list_element)))))
+}
+
+names(result_list_for_exlsx) <- names(result_list)
+
+openxlsx::write.xlsx(as.data.frame(result_list_for_exlsx), file = "~/workspace/Rproject/Results/AB_CD_ATAC_RNA_seq/AB_CD_UP_DOWN.xlsx")
+
+#Plot Venn diagrams
+
+deg_dir <- "~/workspace/Rproject/Results/AB_CD_ATAC_RNA_seq/"
+
+AB_UP <- list("AB_RNA_UP"         = RNA_seq_UP$AB_positive[!is.na(RNA_seq_UP$AB_positive)],
+              "AB_ATAC_UP"        = AB_ATAC_UP)
+ggsave(filename = file.path(deg_dir, "AB_ATAC_RNA_venn_UP_plot.png"), 
+       plot=ggvenn::ggvenn(data = AB_UP, auto_scale = T),
+       width = 20, height = 20, units = "cm")
+
+AB_DOWN <- list("AB_RNA_DOWN"         = RNA_seq_DOWN$AB_down[!is.na(RNA_seq_DOWN$AB_down)],
+              "AB_ATAC_DOWN"        = AB_ATAC_DOWN)
+ggsave(filename = file.path(deg_dir, "AB_ATAC_RNA_venn_DOWN_plot.png"), 
+       plot=ggvenn::ggvenn(data = AB_DOWN, auto_scale = T),
+       width = 20, height = 20, units = "cm")
+
+
+CD_UP <- list("CD_RNA_UP"         = RNA_seq_UP$CD_positive[!is.na(RNA_seq_UP$CD_positive)],
+              "CD_ATAC_UP"        = CD_ATAC_UP)
+ggsave(filename = file.path(deg_dir, "CD_ATAC_RNA_venn_UP_plot.png"), 
+       plot=ggvenn::ggvenn(data = CD_UP, auto_scale = T),
+       width = 20, height = 20, units = "cm")
+
+CD_DOWN <- list("CD_RNA_DOWN"         = RNA_seq_DOWN$CD_down[!is.na(RNA_seq_DOWN$CD_down)],
+              "CD_ATAC_DOWN"        = CD_ATAC_DOWN)
+ggsave(filename = file.path(deg_dir, "CD_ATAC_RNA_venn_DOWN_plot.png"), 
+       plot=ggvenn::ggvenn(data = CD_DOWN, auto_scale = T),
+       width = 20, height = 20, units = "cm")
+
+```
+
+
+```{r "re-plotting volcano plot for diff TF"}
+diffTFq005 <- read.table(header = T, file = "~/workspace/diffTF/runs/20230328/output/20230328/FINAL_OUTPUT/extension100/Tumor_pls_NK_TP2_vs_Tumor_only_TP_1.summary.tsv.gz")
+
+#### Adapted from diffTF scripts 
+#### All credit goes to the creators
+
+transform_yValues <- function(values, addPseudoCount = TRUE, nPermutations, onlyForZero = TRUE) {
+    
+    # Should only happen with the permutation-based approach
+    zeros = which(values == 0)
+    if (length(zeros) > 0 & addPseudoCount) {
+        values[zeros] = 1 / nPermutations
+    }
+    
+    -log10(values)
+}
+
+transform_yValues_caption <- function() {
+    "-log10"
+}
+
+significanceThresholdCur <- 0.05
+
+output.global.TFs <-  diffTFq005 %>%
+                mutate( pValueAdj_log10 = transform_yValues(pvalueAdj, 
+                                                            addPseudoCount = TRUE, 
+                                                            nPermutations = par.l$nPermutations),
+                        pValue_log10    = transform_yValues(pvalue,    
+                                                            addPseudoCount = TRUE, 
+                                                            nPermutations = par.l$nPermutations),
+                        pValueAdj_sig   = pvalueAdj <= significanceThresholdCur,
+                        pValue_sig      = pvalue <= significanceThresholdCur) 
+
+thresholdCur <- 0.05
+pValueScoreCur = "pValueAdj_log10"
+pValueSigCur = "pValueAdj_sig"
+pValueStrLabel = "adj. p-value"
+colnameClassificationFinal <- "classification_q0.05_final"
+showClasses <- c("activator","undetermined","repressor")
+par.l <-  list()
+par.l$colorCategories <-  c("activator" = "#4daf4a", "undetermined" = "grey16", "repressor" = "#e41a1c") # diverging, modified
+par.l$colorConditions <- c( "#67a9cf","#ef8a62") # Colors of the two conditions for the background
+par.l$plot_grayColor <-  "grey50"
+
+additional_TFs_to_plot <- c("STAT1")
+
+ggrepel_df <-  dplyr::filter(output.global.TFs, 
+                             pValueAdj_sig == TRUE | (TF %in% additional_TFs_to_plot))
+ggrepel_df <- dplyr::filter(ggrepel_df, 
+                            !(classification_q0.05 %in% c("not-expressed", "undetermined")) | (TF %in% additional_TFs_to_plot))
+maxPValue <-  max(output.global.TFs$pValueAdj_log10, na.rm = TRUE)
+
+ymax <-  max(transform_yValues(significanceThresholdCur, 
+                               addPseudoCount = TRUE, 
+                               nPermutations = 1000), 
+             maxPValue, na.rm = TRUE) * 1.1
+alphaValueNonSign = 0.3
+
+output.global.TFs <-  dplyr::filter(output.global.TFs, !!as.name(colnameClassificationFinal) %in% showClasses)
+ 
+conditionComparison <- c("Tumor_only_TP_1","Tumor_pls_NK_TP2")
+g <-  ggplot()
+                
+label_nameChange <-  'TF activity higher in'
+
+labelLegendCur <-  paste0("TF class (stringency: ", thresholdCur, ")")
+g <-  g + geom_point(data = output.global.TFs, 
+                   aes_string("weighted_meanDifference", 
+                              pValueScoreCur, 
+                              alpha = pValueSigCur, 
+                              size = "TFBS", 
+                              fill =colnameClassificationFinal),  
+                              shape=21, stroke = 0.5, color = "black") +  
+                    scale_fill_manual(labelLegendCur, values = par.l$colorCategories)
+                    
+overlay_plot_index <- ggrepel_df[[colnameClassificationFinal]] %in% c("activator", "repressor")
+
+g <-  g + geom_point(data = ggrepel_df[overlay_plot_index,], 
+                   aes_string("weighted_meanDifference", 
+                              pValueScoreCur, 
+                              alpha = pValueSigCur, 
+                              size = "TFBS", 
+                              fill =colnameClassificationFinal),  
+                              shape=21, stroke = 0.5, color = "black")
+
+                    g <-  g + geom_rect(aes(xmin = -Inf,xmax = 0,ymin = -Inf, ymax = Inf, color = par.l$colorConditions[2]),
+                                      alpha = .3, fill = par.l$colorConditions[2], size = 0) +
+                        geom_rect(aes(xmin = 0, xmax = Inf, ymin = -Inf,ymax = Inf, color = par.l$colorConditions[1]), alpha = .3, fill = par.l$colorConditions[1], size = 0) + 
+                        scale_color_manual(name = label_nameChange, values = par.l$colorConditions, labels = conditionComparison)
+
+
+g <-  g + ylim(-0.1,ymax) + 
+                    ylab(paste0(transform_yValues_caption(), " (", pValueStrLabel, ")")) + 
+                    xlab("weighted mean difference") + 
+                    scale_alpha_manual(paste0(pValueStrLabel, " < ", significanceThresholdCur), values = c(alphaValueNonSign, 1), labels = c("no", "yes")) + 
+                    geom_hline(yintercept = transform_yValues(significanceThresholdCur, addPseudoCount = TRUE, nPermutations = par.l$nPermutations), linetype = "dotted") 
+                
+
+TFLabelSize <- 3
+    g <-  g +  ggrepel::geom_label_repel(data = ggrepel_df, aes_string("weighted_meanDifference", pValueScoreCur, label = "TF", fill = colnameClassificationFinal),
+                                                  size = TFLabelSize, fontface = 'bold', color = 'white',
+                                                  segment.size = 0.5, box.padding = unit(0.2, "lines"), max.iter = 5000,
+                                                  label.padding = unit(0.2, "lines"), # how thick is connectin line
+                                                  nudge_y = 0.05, nudge_x = 0,  # how far from center points
+                                                  segment.alpha = .8, segment.color = par.l$plot_grayColor, show.legend = FALSE , min.segment.length = 0)
+    
+   g <-  g + guides(alpha = guide_legend(override.aes = list(size=5), order = 2),
+                                   fill = guide_legend(override.aes = list(size=5), order = 3),
+                                   color = guide_legend(override.aes = list(size=5), order = 1)) 
+   g + theme(text=element_text(size=16))
+   
+
+deg_dir <- "~/workspace/Rproject/Results/diffTF/"
+
+ggsave(filename = file.path(deg_dir, "diffTF_q0.05_p0.05.png"), 
+       plot=g,
+       width = 20, height = 20, units = "cm")
+
+ggsave(filename = file.path(deg_dir, "diffTF_q0.05_p0.05.eps"), 
+       plot=g,
+       width = 20, height = 20, units = "cm")
+```
