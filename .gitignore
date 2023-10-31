@@ -1,0 +1,13 @@
+Rproject/Results/old/
+work/
+.Rproj.user
+*.bam
+*.bai
+data_ATACSeq_nfcore_run/results/
+core
+ab3_env/
+renv/
+diffTF/runs/20230328/output
+*.fa
+references/TFs/TFBS_mm10_PWMScan_HOCOMOCOv10.tar.gz
+diffTF/runs/20230328/.snakemake/
