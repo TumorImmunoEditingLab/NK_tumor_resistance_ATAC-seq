@@ -1,0 +1,37 @@
+{
+  "par_general": {
+    "outdir": "output/20230328",
+    "maxCoresPerRule": 1,
+    "dir_TFBS_sorted": false,
+    "regionExtension": 100,
+    "comparisonType": "Tumor_pls_NK_TP2_vs_Tumor_only_TP_1",
+    "conditionComparison": "Tumor_only_TP_1,Tumor_pls_NK_TP2",
+    "designContrast": "~ experiment_id + conditionSummary",
+    "designContrastRNA": "~ experiment_id + conditionSummary",
+    "designVariableTypes": "experiment_id:factor, conditionSummary:factor",
+    "nPermutations": 1000,
+    "nBootstraps": 1000,
+    "nCGBins": 10,
+    "TFs": "all",
+    "dir_scripts": "../../diffTF_code/src/R",
+    "RNASeqIntegration": true,
+    "debugMode": false
+  },
+  "samples": {
+    "summaryFile": "sampleData.tsv",
+    "pairedEnd": true
+  },
+  "peaks": {
+    "consensusPeaks": "../../../references/dds_consensus_1_peaks_chr.tsv",
+    "peakType": "narrow",
+    "minOverlap": 2
+  },
+  "additionalInputFiles": {
+    "refGenome_fasta": "../../../references/Mus_musculus.GRCm38.dna.primary_assembly.chrtag.fa",
+    "dir_TFBS": "../../../references/TFs/PWMScan_HOCOMOCOv10",
+    "RNASeqCounts": "../../../references/RNA_seq_raw_counts_AB.tsv",
+    "HOCOMOCO_mapping": "../../diffTF_code/src/TF_Gene_TranslationTables/HOCOMOCO_v10/translationTable_mm10.csv"
+  }
+}
+
+
